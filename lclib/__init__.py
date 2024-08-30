@@ -79,22 +79,22 @@ DEFAULT_LOG_LEVEL = 20 # logging.INFO
 # Global variables set by init()
 MANAGER_ADDRESS = ('control', DEFAULT_MANAGER_PORT)
 config = {}
-LOG_DIR = None
 
 # Get computer name and IP addresses
 uname = platform.uname()
 local_hostname = uname.node
-if uname.system == "Linux":
+local_platform = uname.system
+if local_platform == "Linux":
     iface_info = json.loads(subprocess.run(['ip', '-j', '-4', 'addr'], capture_output=True).stdout.decode())
     local_ip_list = [iface['addr_info'][0]['local'] for iface in iface_info]
-elif uname.system == "Windows":
+elif local_platform == "Windows":
     s = subprocess.run(['ipconfig', '/allcompartments'], capture_output=True).stdout.decode()
     local_ip_list = [x.split(' ')[-1] for x in s.split('\r\n') if x.strip().startswith('IPv4')]
-elif uname.system == "Darwin":
+elif local_platform == "Darwin":
     ip = str(subprocess.check_output(["ifconfig | grep inet"], shell=True)[:-2], 'UTF-8')
     local_ip_list = [x.split(' ')[1] for x in ip.split('\t') if x.split(' ')[0] == 'inet']
 else:
-    raise RuntimeError(f'Unknown system platform {uname.system}')
+    raise RuntimeError(f'Unknown system platform {local_platform}')
 
 # Remove localhost (not there under windows)
 try:
@@ -105,7 +105,7 @@ except ValueError:
 def get_config():
     return config
 
-def client_or_None(name, admin=True, client_name=None, inexistent_ok=True):
+def client_or_None(name, admin=True, client_name=None, inexistent_ok=True, keep_trying=False):
     """
     Helper function to create a client to a named driver
 
@@ -114,6 +114,7 @@ def client_or_None(name, admin=True, client_name=None, inexistent_ok=True):
         admin (bool): try to connect as admin [default True]
         client_name: an identifier for the client
         inexistent_ok: if True, ignore unknown names.
+        keep_trying: if True, the client object is returned even if the connection was not successful
 
     Returns:
         An instance of the proxy client connected to named driver, or None if connection failed.
@@ -127,7 +128,10 @@ def client_or_None(name, admin=True, client_name=None, inexistent_ok=True):
         else:
             raise RuntimeError(f'Could not find class {name}. Has the corresponding module been imported?')
     try:
-        d = _driver_classes[name].Client(admin=admin, name=client_name)
+        if keep_trying:
+            d = _driver_classes[name].Client(admin=admin, name=client_name, reconnect='always')
+        else:
+            d = _driver_classes[name].Client(admin=admin, name=client_name)
     except ProxyDeviceError as e:
         logs.logger.info(str(e))
     return d
@@ -171,7 +175,8 @@ def init(lab_name,
         data_path: Main path to save data (from control node)
         manager_address: the address for the manager.
     """
-    global config, LOG_DIR, MANAGER_ADDRESS
+    global config, MANAGER_ADDRESS
+    BANNER = '*{0:^120}*'
 
     #
     # Lab name
@@ -200,7 +205,7 @@ def init(lab_name,
     config['conf_path'] = conf_path
     config['module'] = parent_module
 
-    print('*{0:^64}*'.format(f'This is {lab_name} (module "{parent_module}")'))
+    print(BANNER.format(f'This is {lab_name} (module "{parent_module}")'))
 
     # Store local info extracted already at import
     config['local_hostname'] = local_hostname
@@ -211,18 +216,20 @@ def init(lab_name,
     #
     # Setup logging on file for interactive sessions
     #
-    LOG_DIR = os.path.join(conf_path, 'logs/')
-    os.makedirs(LOG_DIR, exist_ok=True)
+    log_dir = os.path.join(conf_path, 'logs/')
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Store for access e.g. by __main__
+    logs.log_dir = log_dir
 
     # Log to file interactive sessions
     if ui.is_interactive():
-        log_file_name = os.path.join(LOG_DIR, f'{lab_name.lower()}-labcontrol.log')
+        log_file_name = os.path.join(log_dir, f'{lab_name.lower()}-labcontrol.log')
         logs.log_to_file(log_file_name)
-        print('*{0:^64}*'.format('[Logging to file on this host]'))
+        print(BANNER.format('[Logging to file on this host]'))
     else:
-        print('*{0:^64}*'.format('[Not logging to file on this host]'))
-
-    print()
+        print(BANNER.format('[Not logging to file on this host]'))
+    print(BANNER.format(""))
 
     logger.debug('Logging config completed')
 
@@ -252,6 +259,11 @@ def init(lab_name,
         MANAGER_ADDRESS = config.get('manager_address', (host_ips['control'], DEFAULT_MANAGER_PORT))
     else:
         MANAGER_ADDRESS = manager_address
+
+    # Tricky bootstrapping - the address has been set at import
+    manager.Manager.Client.ADDRESS = MANAGER_ADDRESS
+    manager.Manager.Server.ADDRESS = MANAGER_ADDRESS
+
     config['manager_address'] = MANAGER_ADDRESS
     logger.debug(f'Manager address: {MANAGER_ADDRESS}')
 
@@ -261,7 +273,7 @@ def init(lab_name,
     try:
         this_host = [name for name, ip in host_ips.items() if ip in local_ip_list][0]
     except IndexError:
-        print('*{0:^64}*'.format('[Host IP not part of the control network.]'))
+        print(BANNER.format('[Host IP not part of the control network.]'))
         this_host = 'unknown'
 
     config['this_host'] = this_host
@@ -270,12 +282,13 @@ def init(lab_name,
     #import inspect
     #print(inspect.stack())
 
-    print('\n'.join(['*{:^64s}*'.format(f"{lab_name} Lab Control"),
-                     '*{:^64s}*'.format(f"Running on host '{local_hostname}'"),
-                     '*{:^64s}*'.format(f"a.k.a. '{this_host}' with IP {local_ip_list}")
+    print('\n'.join([BANNER.format(f"{lab_name} Lab Control"),
+                     BANNER.format(f"Running on host '{local_hostname}'"),
+                     BANNER.format(f"a.k.a. '{this_host}' with IP {local_ip_list}")
                      ])
           )
 
+from . import manager
 from . import base
 from . import camera
 from . import ui

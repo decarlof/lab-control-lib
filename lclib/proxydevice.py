@@ -86,6 +86,7 @@ import sys
 import traceback
 import builtins
 import pickle
+import enum
 
 from .util import Future
 from .logs import logger as rootlogger
@@ -355,7 +356,7 @@ class ProxyClientBase:
     SLEEP_INTERVAL = 0.1
     RECONNECT_INTERVAL = 3.0
 
-    def __init__(self, admin=True, name=None, args=None, kwargs=None, clean=True, reconnect=True):
+    def __init__(self, admin=True, name=None, args=None, kwargs=None, clean=True, reconnect='if_successful'):
         """
         Base class for client proxy. Subclasses are created dynamically by the
         `proxydevice` decorator.
@@ -368,7 +369,7 @@ class ProxyClientBase:
         kwargs (dicts): same as args above
         clean (bool): If false, non-blocking calls will not "fake block"
                       awaiting result.
-        reconnect(bool): If true, keep trying to reconnect when the server is lost.
+        reconnect: one of 'if_successful' (default), 'always', or 'never'
         """
         self.name = self.__class__.__name__
         self.client_name = name or self.name
@@ -438,7 +439,14 @@ class ProxyClientBase:
         self._terminate = True
 
     def kill_server(self):
-        self.conn.root.kill()
+        try:
+            self.conn.root.kill()
+        except EOFError:
+            # This is normal - the connection was lost mid-way
+            pass
+        except:
+            raise
+        self.disconnect()
 
     def _serve(self):
         """
@@ -457,7 +465,7 @@ class ProxyClientBase:
                 )
             except ConnectionRefusedError:
                 # No server present
-                if self.first_connect or not self.reconnect:
+                if (self.reconnect != 'always') or ((self.reconnect == 'if_successful') and self.first_connect) or (self.reconnect == 'never'):
                     self.logger.error(f"Connection to {self.ADDRESS} refused. Is the server running?")
                     raise
 
@@ -483,7 +491,7 @@ class ProxyClientBase:
             except EOFError:
                 # Connection closed!
                 self.logger.warning("Connection lost.")
-                if self.reconnect:
+                if self.reconnect != 'never':
                     continue
                 raise
         try:
@@ -599,11 +607,16 @@ class ProxyClientBase:
             # In non-blocking mode, we have to wait for result
             # and catch keyboard interrupts to try and abort the command
             def method(client_self, *args, **kwargs):
+                t0 = time.time()
+
                 # Find remote method to call
                 service_method = getattr(client_self.conn.root, name)
 
                 # This calls the remote method, but since it is non-blocking it returns immediately
                 reply = _um(service_method(_m(args), _m(kwargs)))
+
+                # Timing statistics are about call delays so we measure time now
+                client_self._update_stats(t0, time.time())
 
                 # Reset awaited result
                 client_self.awaited_result = None
@@ -726,7 +739,7 @@ class ProxyServerBase:
 
         # Replace print and input
         self.logger.info("Rerouting 'print' and 'input'")
-        mods = [sys.modules[cn.__module__] for cn in [self.instance.__class__] + list(self.instance.__class__.__bases__) if cn.__module__ != 'builtins']
+        mods = [sys.modules[cn.__module__] for cn in self.instance.__class__.__mro__ if cn.__module__ != 'builtins']
 
         for mod in mods:
             mod.print = self._proxy_print

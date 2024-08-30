@@ -82,7 +82,8 @@ class DriverBase:
 
     logger = None                       # Place-holder. Gets defined at construction.
     motors = {}
-    DEFAULT_CONFIG = {}
+    DEFAULT_CONFIG = {'log_level': logging.INFO,
+                      'quiet': True}
 
     def __init__(self):
         """
@@ -109,6 +110,9 @@ class DriverBase:
         for k, v in self.DEFAULT_CONFIG.items():
             self.config.setdefault(k, v)
 
+        # Set logging level
+        self.set_log_level(self.config['log_level'])
+
         # Dictionary of metadata calls
         self.metacalls = {}
 
@@ -133,8 +137,8 @@ class DriverBase:
 
     def _periodic_call(self, method, interval):
         """
-        This thread runs on a separate thread and calls
-        the given method at a given interval.
+        This method runs on a separate thread and calls
+        the provided method at a given interval (in seconds)
         """
         t0 = time.time()
         n = 0
@@ -188,6 +192,22 @@ class DriverBase:
         Shutdown procedure registered with atexit.
         """
         pass
+
+    @proxycall(admin=True)
+    @property
+    def quiet(self):
+        return self.config['quiet']
+
+    @quiet.setter
+    def quiet(self, value):
+        self.config['quiet'] = bool(value)
+
+    def print(self, s='', end='\n'):
+        """
+        Print if printing is on.
+        """
+        if not self.quiet:
+            print(s, end=end, flush=True)
 
     @classmethod
     def register_motor(cls, motor_name, **kwargs):
