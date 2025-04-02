@@ -72,7 +72,7 @@ import threading
 from queue import SimpleQueue, Empty
 import time
 
-from . import manager, proxycall
+from . import monitor, manager, proxycall, client_or_None
 from .base import DriverBase
 from .util import now, Future, frameconsumer
 
@@ -105,7 +105,8 @@ class CameraBase(DriverBase):
                             'save_path': None,
                             'operation_mode': None,
                             'exposure_time': 1.,
-                            'exposure_number': 1}
+                            'exposure_number': 1,
+                            'accumulation_number': 1}
 
     # python >3.9
     # DEFAULT_CONFIG = (DriverBase.DEFAULT_CONFIG | LOCAL_DEFAULT_CONFIG)
@@ -122,6 +123,12 @@ class CameraBase(DriverBase):
             self.broadcast_address = self.DEFAULT_BROADCAST_ADDRESS
         else:
             self.broadcast_address = broadcast_address
+
+        # Clients to monitor and manager
+        self.monitor = client_or_None('monitor', keep_trying=True)
+
+        # TODO: in the future, we should be able to swap managers
+        self.manager = client_or_None('manager', keep_trying=True)
 
         self.store_future = None      # Will be replaced with a future when starting to store.
         self._stop_roll = False       # To interrupt rolling
@@ -160,6 +167,8 @@ class CameraBase(DriverBase):
 
         self.frame_queue = SimpleQueue()
         self.frame_future = Future(self.frame_management_loop)
+
+        self._last_frame = (None, None)
 
         # Broadcasting process
         self.frame_streamer = frameconsumer.FrameStreamer(self.broadcast_address[1])
@@ -217,9 +226,7 @@ class CameraBase(DriverBase):
             self.logger.warning("Cannot snap while in rolling mode.")
             return
 
-        # If the manager crashes, getManager() will return None and we can't continue
-        man = manager.getManager()
-        if man is None:
+        if not self.manager.connected:
             self.logger.error("Not connected to manager! Can't start acquisition!")
             return
 
@@ -237,7 +244,7 @@ class CameraBase(DriverBase):
 
         # Build filename
         if self.in_scan:
-            prefix = man.next_prefix()
+            prefix = self.manager.next_prefix()
             self.filename = self._build_filename(prefix=prefix, path=self._scan_path)
         else:
             self.counter += 1
@@ -374,11 +381,10 @@ class CameraBase(DriverBase):
             self.logger.debug('Metadata collection requested (grab_metadata flag)')
 
             # Request global metadata (exclude self, we do that locally instead)
-            man = manager.getManager()
-            if man is None:
-                self.logger.error("Not connected to manager! Cannot request metadata!")
+            if not self.monitor.connected:
+                self.logger.error("Not connected to monitor! Cannot request metadata!")
             else:
-                man.request_meta(request_ID=self.name, exclude_list=[self.name])
+                self.monitor.request_meta(request_ID=self.name, exclude_list=[self.name])
 
             # Local metadata
             self.localmeta = self.get_meta()
@@ -429,20 +435,23 @@ class CameraBase(DriverBase):
                 self.frame_queue_empty_flag.set()
 
     @proxycall()
+    @property
+    def last_frame(self):
+        return self._last_frame
+
+    @proxycall()
     def get_meta(self, metakeys=None):
         """
         Return camera-specific metadata
         """
-        man = manager.getManager()
-
-        if man is None:
+        if not self.manager.connected:
             self.logger.error("Could not connect to manager! metadata will be incomplete.")
             scan_name = "[unknown]"
             scan_counter = None
         else:
-            scan_name = man.scan_name
-            scan_path = man.scan_path
-            scan_counter = man.get_counter() if scan_path else None
+            scan_name = self.manager.scan_name
+            scan_path = self.manager.scan_path
+            scan_counter = self.manager.get_counter() if scan_path else None
 
         meta = {'detector': self.name,
                 'scan_name': scan_name,
@@ -454,7 +463,8 @@ class CameraBase(DriverBase):
                 'filename': self.filename,
                 'snap_counter': self.counter,
                 'scan_counter': scan_counter,
-                'tags': self.tags}
+                'tags': self.tags,
+                'accumulation_number': self.accumulation_number}
         return meta
 
     def enqueue_frame(self, frame, meta):
@@ -481,6 +491,8 @@ class CameraBase(DriverBase):
             # Update frame metadata and add to queue
             localmeta.update(meta)
             metadata[self.name.lower()] = localmeta
+
+            self._last_frame = (frame, metadata)
 
             self.frame_queue.put((frame, metadata))
             self.logger.debug('Frame added to queue.')
@@ -537,12 +549,11 @@ class CameraBase(DriverBase):
         self.do_acquire.clear()
 
         # Check if this is part of a scan
-        man = manager.getManager()
-        if man is None:
+        if not self.manager.connected:
             self.logger.error("Not connected to manager! Can't check scan path!")
             self._scan_path = None
         else:
-            self._scan_path = man.scan_path
+            self._scan_path = self.manager.scan_path
 
         # Finish arming with subclassed method
         self._arm()
@@ -557,11 +568,10 @@ class CameraBase(DriverBase):
         """
         True if within a scan context.
         """
-        man = manager.getManager()
-        if man is None:
+        if not self.manager.connected:
             self.logger.error("Could not connect to manager!")
             return False
-        return man.scan_path is not None
+        return self.manager.scan_path is not None
 
     @proxycall(admin=True)
     def disarm(self):
@@ -776,6 +786,13 @@ class CameraBase(DriverBase):
         """
         raise NotImplementedError
 
+    def _set_accumulation_number(self, value):
+        """
+        Optional method to manage side effects of accumulation, such as modifying internally the number of
+        frames to acquire.
+        """
+        pass
+
     #
     # PROPERTIES
     #
@@ -828,13 +845,27 @@ class CameraBase(DriverBase):
     @property
     def exposure_time(self):
         """
-        Exposure time in seconds.
+        Total exposure time in seconds (shutter speed is this / self.accumulation_number)
         """
-        return self._get_exposure_time()
+        return self.accumulation_number * self.sub_exposure_time
 
     @exposure_time.setter
     def exposure_time(self, value):
-        self._set_exposure_time(value)
+        if value == 0:
+            raise RuntimeError('Exposure time cannot be zero')
+        try:
+            value = float(value)
+        except ValueError:
+            raise RuntimeError(f'Exposure time must be float. Invalid value: {value}')
+        self._set_exposure_time(value / self.accumulation_number)
+
+    @proxycall()
+    @property
+    def sub_exposure_time(self):
+        """
+        Actual exposure time (or shutter speed) of the detector. Read-only property.
+        """
+        return self._get_exposure_time()
 
     @proxycall(admin=True)
     @property
@@ -858,7 +889,36 @@ class CameraBase(DriverBase):
 
     @exposure_number.setter
     def exposure_number(self, value):
+        if value == 0:
+            raise RuntimeError('Exposure number cannot be zero')
+        elif not isinstance(value, int):
+            raise RuntimeError(f'Exposure number must be integer. Invalid value: {value}')
         self._set_exposure_number(value)
+
+    @proxycall(admin=True)
+    @property
+    def accumulation_number(self):
+        """
+        Number of accumulations. Setting this value keeps the total exposure time unchanged, but will
+        change the sub_exposure_time (internal detector shutter speed).
+        """
+        return self.config['accumulation_number']
+
+    @accumulation_number.setter
+    def accumulation_number(self, value):
+        if value is None:
+            value = 1
+        elif not isinstance(value, int):
+            raise TypeError('Accumulation number must be an integer')
+        # Get current total exposure time
+        exp_time = self.exposure_time
+        # Store new accumulation number
+        self.config['accumulation_number'] = value
+        # Reset exposure time. This will change the sub_exposure_time (shutter speed) but keep the same total exposure time
+        self.exposure_time = exp_time
+        # Call other method to allow subclasses to manage additional side-effects
+        self._set_accumulation_number(value)
+
 
     @proxycall(admin=True)
     @property

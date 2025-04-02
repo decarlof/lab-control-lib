@@ -11,20 +11,24 @@ import inspect
 import os
 import logging
 
-from .. import _driver_classes, get_config, drivers, motors, client_or_None
+from .. import _driver_classes, get_config, drivers, motors, client_or_None, local_hostname
 from . import uitools
+from ..util import FileDict
 from . import ask, ask_yes_no, user_prompt
 from ..logs import logger as rootlogger
 from .. import manager
 
+# Set up logger
 logger = rootlogger.getChild(__name__)
 
-_current_detector = []
+# Dictionary populated by init() at runtime, and possibly other future functions that set some defaults
+_runtime = {'manager': None}
+
 INVESTIGATIONS = None
 
 __all__ = ['init', 'Scan', 'choose_experiment', 'choose_investigation']
 
-def init(yes=None):
+def init(yes=None, manager_name='manager'):
     """
     Initialize components of the setup.
     Syntax:
@@ -34,15 +38,32 @@ def init(yes=None):
         # Fake non-interactive to answer all questions automatically
         uitools.user_interactive = False
 
-    # Experiment management
-    man = manager.getManager()
-    print(man.status())
-    load_past_investigations()
-
     client_name = f'main-client-{get_config()["this_host"]}'
 
+    # List of registered drivers - minus the Manager(s)
+    registered_drivers = [name for name, cls in _driver_classes.items() if not (issubclass(cls, manager.ManagerBase) or name == 'monitor')]
+
+    # First check that monitor is running
+    monitor_client = client_or_None('monitor', client_name=client_name)
+    if monitor_client is None:
+        raise RuntimeError('Could not connect to monitor! Is it running?')
+    drivers['monitor'] = monitor_client
+
+    # Experiment management
+    man = client_or_None(manager_name, keep_trying=False, admin=True)
+    if man is None:
+        raise RuntimeError(f'Could not connect to manager {manager_name}.')
+    drivers[manager_name] = man
+
+    # Keep track of current manager
+    _runtime['manager_name'] = manager_name
+    _runtime['manager'] = man
+
+    # Print out some information
+    print(" * Investigation: {investigation}\n * Experiment: {experiment}\n * Last Scan: {last_scan}".format(**man.status()))
+
     # Loop through registered driver classes
-    for name, cls in _driver_classes.items():
+    for name in registered_drivers:
         if not ask_yes_no(f'Connect to {name}?'):
             continue
 
@@ -55,7 +76,7 @@ def init(yes=None):
             continue
 
         # Instantiate motors if they exist
-        new_motors = cls.create_motors(driver=driver_client)
+        new_motors = _driver_classes[name].create_motors(driver=driver_client)
 
         for motorname in new_motors.keys():
             logger.info(f'Created motor "{motorname}" ({name})')
@@ -88,10 +109,42 @@ class Scan:
         """
         Prepare for scan
         """
-        man = manager.getManager()
+        man = _runtime['manager']
+        if man is None:
+            raise RuntimeError('The experiment manager is not present. Did you run "init"?')
 
+        # Calling context
+        import __main__
+        try:
+            # Try and find calling script and content
+            script_name = __main__.__file__
+            calling_path = os.getcwd()
+            script_name = os.path.join(calling_path, script_name)
+            script_content = open(script_name).read()
+        except AttributeError:
+            # No calling script - probably interactive mode
+            if uitools.is_interactive():
+                script_name = '<interactive>'
+            else:
+                import sys
+                script_name = sys.argv[0]
+            script_content = ''
+
+        # Script content was found: we look for the line currently being executed for further documentation
+        line_number = None
+        if script_content:
+            import inspect
+            stack = inspect.stack()
+            for frame in stack:
+                if frame.filename == script_name:
+                    line_number = frame.lineno
+                    break
+        localmeta = {'script_name': script_name,
+                      'calling_host': local_hostname,
+                      'script_content': script_content,
+                      'line_number': line_number}
         # New scan
-        self.scan_data = man.start_scan(label=self.label)
+        self.scan_data = man.start_scan(label=self.label, localmeta=localmeta)
 
         self.name = self.scan_data['scan_name']
         self.scan_path = self.scan_data['path']
@@ -108,41 +161,8 @@ class Scan:
 
         TODO: manage exceptions
         """
-        manager.getManager().end_scan()
+        _runtime['manager'].end_scan()
         self.logger.info(f'Scan {self.name} complete.')
-
-
-# Get data directly from file directory structure
-def load_past_investigations(path=None):
-    """
-    Scan data_path directory structure and extract past investigations/experiments.
-
-    """
-    path = path or get_config()['data_path']
-
-    investigations = {}
-
-    all_inv = {f.name: f.path for f in os.scandir(path) if f.is_dir()}
-    for inv, inv_path in all_inv.items():
-        all_exp = {f.name: f.path for f in os.scandir(inv_path) if f.is_dir()}
-        exp_dict = {}
-        for exp, exp_path in all_exp.items():
-            # Scan directories are of the format %05d or %05d_some_label
-            all_scans = {}
-            for f in os.scandir(exp_path):
-                if f.is_dir():
-                    try:
-                        all_scans[int(f.name[:6])] = f.name
-                    except ValueError:
-                        print(f'{f.name} is an alien directory. Ignored.')
-            exp_dict[exp] = all_scans
-
-        # This updates the module-level dictionary
-        investigations[inv] = exp_dict
-
-    globals()['INVESTIGATIONS'] = investigations
-    return investigations
-
 
 def choose_investigation(name=None):
     """
@@ -150,31 +170,26 @@ def choose_investigation(name=None):
     If non-interactive and `name` is not None: select/create
     investigation with name `name`.
     """
-    # Load past investigations if needed
-    if not INVESTIGATIONS:
-        load_past_investigations(get_config()['data_path'])
+    # Get experiment manager
+    man = _runtime['manager']
+    if man is None:
+        raise RuntimeError('The experiment manager is not present. Did you run "init"?')
 
-    if name is not None:
-        inv = name
-        if inv not in INVESTIGATIONS:
-            INVESTIGATIONS[inv] = {}
-    else:
-        if not INVESTIGATIONS:
-            inv = user_prompt('Enter new investigation name:')
-            INVESTIGATIONS[inv] = {}
+    invkeys = man.list_inv()
+
+    if name is None:
+        if not invkeys:
+            name = user_prompt('Enter new investigation name:')
         else:
-            invkeys = list(INVESTIGATIONS.keys())
             values = list(range(len(invkeys)+1))
             labels = ['0) [new investigation]'] + [f'{i+1}) {v}' for i, v in enumerate(invkeys)]
             ichoice = ask('Select investigation', clab=labels, cval=values, multiline=True)
             if ichoice == 0:
-                inv = user_prompt('Enter new investigation name:')
-                INVESTIGATIONS[inv] = {}
+                name = user_prompt('Enter new investigation name:')
             else:
-                inv = invkeys[ichoice-1]
-    manager.getManager().investigation = inv
-    return inv
-
+                name = invkeys[ichoice-1]
+    _runtime['manager'].investigation = name
+    return name
 
 def choose_experiment(name=None, inv=None):
     """
@@ -182,35 +197,24 @@ def choose_experiment(name=None, inv=None):
     If non-interactive and `name` is not None: select/create
     experiment with name `name`.
     """
-    # Load past investigations if needed
-    if not INVESTIGATIONS:
-        load_past_investigations(get_config()['data_path'])
+    # Get experiment manager
+    man = _runtime['manager']
+    if man is None:
+        raise RuntimeError('The experiment manager is not present. Did you run "init"?')
 
-    # Use global investigation name if none was provided
-    if inv is None:
-        inv = manager.getManager().investigation
-
-    # This will break if inv is not a key of investigations
-    # So be it. Create one first.
-    experiments = INVESTIGATIONS[inv]
+    expkeys = man.list_exp(inv=inv)
 
     # Now select or create new experiment
-    if name is not None:
-        exp = name
-    else:
-        if not experiments:
-            exp = user_prompt('Enter new experiment name:')
+    if name is None:
+        if not expkeys:
+            name = user_prompt('Enter new experiment name:')
         else:
-            expkeys = list(experiments.keys())
             values = list(range(len(expkeys) + 1))
             labels = ['0) [new experiment]'] + [f'{i+1}) {v}' for i, v in enumerate(expkeys)]
             ichoice = ask('Select experiment:', clab=labels, cval=values, multiline=True)
             if ichoice == 0:
-                exp = user_prompt('Enter new experiment name:')
+                name = user_prompt('Enter new experiment name:')
             else:
-                exp = expkeys[ichoice - 1]
-    exp_path = os.path.join(os.path.join(get_config()['data_path'], inv), exp)
-    print(f'Experiment: {exp} at {exp_path}')
-    os.makedirs(exp_path, exist_ok=True)
-    manager.getManager().experiment = exp
-    return exp
+                name = expkeys[ichoice - 1]
+    man.experiment = name
+    return name
