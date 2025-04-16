@@ -29,7 +29,7 @@ def list_investigations(path):
     Returns:
         list of investigations
     """
-    return [f.name for f in os.scandir(path) if f.is_dir()]
+    return [f.name for f in os.scandir(path) if f.is_dir() and not f.name.startswith('.')]
 
 def list_scans(path, investigation, experiment=None, logger=None):
     """
@@ -51,7 +51,7 @@ def list_scans(path, investigation, experiment=None, logger=None):
         if not os.path.exists(inv_path):
             raise RuntimeError(f'Experiment {experiment} does not exist')
         try:
-            scan_list = sorted([(int(f.name[:6]), f.name[6:]) for f in os.scandir(exp_path) if f.is_dir()])
+            scan_list = sorted([(int(f.name[:6]), f.name[7:]) for f in os.scandir(exp_path) if f.is_dir() and not f.name.startswith('.')])
         except ValueError:
             raise RuntimeError(f'Alien directory {exp_path}')
         return {experiment: scan_list}
@@ -60,7 +60,7 @@ def list_scans(path, investigation, experiment=None, logger=None):
     scan_dict = {}
     for exp, exp_path in all_exp.items():
         try:
-            scan_list = sorted([(int(f.name[:6]), f.name[6:]) for f in os.scandir(exp_path) if f.is_dir()])
+            scan_list = sorted([(int(f.name[:6]), f.name[7:]) for f in os.scandir(exp_path) if f.is_dir() and not f.name.startswith('.')])
         except ValueError:
             if logger:
                 logger.warning(f'{exp_path} is an alien directory. Ignored.')
