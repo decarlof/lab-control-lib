@@ -226,6 +226,7 @@ class MonitorBase(DriverBase):
         """
         stats = {}
         for name, c in self.clients.items():
+            stats[name] = None
             try:
                 if not c.connected:
                     continue
