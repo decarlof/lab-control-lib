@@ -356,7 +356,7 @@ class ProxyClientBase:
     SLEEP_INTERVAL = 0.1
     RECONNECT_INTERVAL = 3.0
 
-    def __init__(self, admin=True, name=None, args=None, kwargs=None, clean=True, reconnect='if_successful'):
+    def __init__(self, admin=True, name=None, args=None, kwargs=None, clean=True, reconnect='if_successful', address=None):
         """
         Base class for client proxy. Subclasses are created dynamically by the
         `proxydevice` decorator.
@@ -370,11 +370,15 @@ class ProxyClientBase:
         clean (bool): If false, non-blocking calls will not "fake block"
                       awaiting result.
         reconnect: one of 'if_successful' (default), 'always', or 'never'
+        address (str, int): (IP, port) of the server. If None, the class
+                        attribute ADDRESS will be used.
         """
         self.name = self.__class__.__name__
         self.client_name = name or self.name
         self.clean = clean
         self.reconnect = reconnect
+        if address is not None:
+            self.ADDRESS = address
 
         # Statistics
         self.stats = {'startup': time.time(),
@@ -697,7 +701,7 @@ class ProxyServerBase:
     API = None
     CLS = None
 
-    def __init__(self, instantiate=True, instance_args=None, instance_kwargs=None):
+    def __init__(self, instantiate=True, instance_args=None, instance_kwargs=None, address=None):
         """
         Base class for server proxy. Subclasses are created dynamically by the
         proxydevice decorator and attaches the defaults ADDRESS, API and CLS as
@@ -709,10 +713,15 @@ class ProxyServerBase:
                             False, instantiation will proceed with the first
                             client connection.
         instance_args/kwargs: args, kwargs to pass for class instantiation.
+        address (str, int): (IP, port) of the serving address. If None, the
+        class attribute ADDRESS will be used.
         """
         # Create logger
         self.logger = rootlogger.getChild(self.__class__.__name__)
         self.name = self.__class__.__name__.lower()
+
+        if address is not None:
+            self.ADDRESS = address
 
         # instance of the class cls once we have received the initialization
         # parameters from the first client (or provided here at construction)
