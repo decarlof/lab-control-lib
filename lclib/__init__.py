@@ -64,7 +64,7 @@ from .proxydevice import ProxyDeviceError, proxydevice, proxycall
 from .util import FileDict
 from . import logs
 from .logs import logger
-from ._version import version
+# from ._version import version
 
 # Base attribute definitions have to be done before relative imports
 
