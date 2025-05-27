@@ -18,6 +18,8 @@ Below is a list of motion controllers and tested stage supported by Lab-Control-
 +---------------------+--------------------+------------------------------+----------------+-----------------------+------------------------+-------------------------+
 
 
+to add additional hardware or report an issue with existing hardware please submit a `GitHub request <https://github.com/optimato/lab-control-lib/issues/new>`_
+
 .. |00001| image:: img/XPS-D-800w.png
    :width: 50px
    :alt: XPS-D-800w
